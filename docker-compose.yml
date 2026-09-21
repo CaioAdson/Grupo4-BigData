@@ -91,24 +91,23 @@ services:
 
   spark-master:
     image: apache/spark:3.5.5
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      - SPARK_CONF_DIR=/opt/spark/conf
     volumes:
       - ./spark:/opt/spark/jobs:ro
-    ports: ["8080:8080", "7077:7077"]
-    restart: unless-stopped
-   
+      - ./spark/conf:/opt/spark/conf:ro
+    
 
   spark-worker:
     image: apache/spark:3.5.5
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     environment:
-      SPARK_WORKER_CORES: "1"
-      SPARK_WORKER_MEMORY: 1g
+      - SPARK_CONF_DIR=/opt/spark/conf
     volumes:
       - ./spark:/opt/spark/jobs:ro
-    depends_on: [spark-master]
-    restart: unless-stopped
-
+      - ./spark/conf:/opt/spark/conf:ro
+      
 volumes:
   events:
   flume-state:

@@ -17,19 +17,30 @@ input_path = os.getenv(
     "hdfs://namenode:8020/ecommerce/raw/events.jsonl"
 )
 
-events = spark.read.json(input_path)
+events = (
+    spark.read.json(input_path)
+    .withColumn("event_date", F.to_date("event_time"))
+)
 
-# Mantém somente compras e calcula a receita.
+# Identifica a data mais recente disponível nos eventos.
+current_date = events.select(F.max("event_date")).first()[0]
+
+print(f"=== DATA ATUAL PROCESSADA: {current_date} ===")
+
+# Compras somente do dia atual.
 purchases = (
     events
-    .filter(F.col("event_type") == "purchase")
+    .filter(
+        (F.col("event_type") == "purchase")
+        & (F.col("event_date") == F.lit(current_date))
+    )
     .withColumn(
         "revenue",
         F.col("price") * F.col("quantity")
     )
 )
 
-# RDD: transformação dos dados para demonstrar o uso de RDD.
+# RDD para demonstrar o processamento com RDD.
 purchase_rdd = purchases.rdd.map(
     lambda row: (
         row["category"],
@@ -37,10 +48,10 @@ purchase_rdd = purchases.rdd.map(
         float(row["revenue"] or 0),
         int(row["quantity"] or 0),
         row["event_id"],
+        row["event_date"],
     )
 )
 
-# Volta para DataFrame para continuar o ETL com Spark SQL/DataFrame.
 purchase_df = spark.createDataFrame(
     purchase_rdd,
     [
@@ -49,13 +60,14 @@ purchase_df = spark.createDataFrame(
         "revenue",
         "quantity",
         "event_id",
+        "event_date",
     ],
 )
 
-# groupBy provoca shuffle e demonstra uma wide dependency.
+# groupBy gera shuffle, demonstrando uma wide dependency.
 daily_sales = (
     purchase_df
-    .groupBy("category", "region")
+    .groupBy("category", "region", "event_date")
     .agg(
         F.round(F.sum("revenue"), 2).alias("total_revenue"),
         F.sum("quantity").alias("items_sold"),
@@ -66,47 +78,130 @@ daily_sales = (
 print("=== VENDAS DO DIA ===")
 daily_sales.show(truncate=False)
 
-# Salva o resultado consolidado no Hive.
+# Atualiza a tabela diária.
 daily_sales.write.mode("overwrite").saveAsTable(
     "ecommerce.daily_sales"
 )
 
-# Histórico: compara as vendas atuais com o histórico disponível.
+# ==========================================================
+# COMPARAÇÃO COM O DIA ANTERIOR
+# ==========================================================
+
+previous_date = (
+    current_date
+    - __import__("datetime").timedelta(days=1)
+)
+
+print(f"=== DIA ANTERIOR ESPERADO: {previous_date} ===")
+
 try:
     historical = spark.table("ecommerce.daily_sales_history")
 
-    comparison = (
-        daily_sales.alias("current")
-        .join(
-            historical.alias("history"),
-            on=["category", "region"],
-            how="left",
-        )
-        .select(
-            "category",
-            "region",
-            F.col("current.total_revenue").alias("current_revenue"),
-            F.col("history.total_revenue").alias("previous_revenue"),
-        )
-        .withColumn(
-            "revenue_difference",
-            F.round(
-                F.col("current_revenue")
-                - F.coalesce(F.col("previous_revenue"), F.lit(0)),
-                2,
-            ),
-        )
+    previous_sales = historical.filter(
+        F.col("event_date") == F.lit(previous_date)
     )
 
-    print("=== COMPARAÇÃO COM HISTÓRICO ===")
-    comparison.show(truncate=False)
+    if previous_sales.limit(1).count() > 0:
+
+        comparison = (
+            daily_sales.alias("current")
+            .join(
+                previous_sales.alias("history"),
+                on=["category", "region"],
+                how="left",
+            )
+            .select(
+                "category",
+                "region",
+                "current.event_date",
+                F.col("current.total_revenue").alias(
+                    "current_revenue"
+                ),
+                F.col("history.total_revenue").alias(
+                    "previous_revenue"
+                ),
+            )
+            .withColumn(
+                "revenue_difference",
+                F.round(
+                    F.col("current_revenue")
+                    - F.coalesce(
+                        F.col("previous_revenue"),
+                        F.lit(0),
+                    ),
+                    2,
+                ),
+            )
+        )
+
+        print(
+            f"=== COMPARAÇÃO: {current_date} "
+            f"X {previous_date} ==="
+        )
+
+        comparison.show(truncate=False)
+
+    else:
+        print(
+            f"Nenhum histórico encontrado para "
+            f"{previous_date}."
+        )
 
 except Exception:
-    print("Nenhum histórico anterior encontrado.")
+    print("Tabela de histórico ainda não existe.")
 
-# Atualiza o histórico com os dados processados.
-daily_sales.write.mode("overwrite").saveAsTable(
+# ==========================================================
+# HISTÓRICO DOS DIAS ANTERIORES
+# ==========================================================
+
+# Reprocessa todas as compras do arquivo bruto para manter
+# o histórico de todos os dias disponíveis.
+all_purchases = (
+    events
+    .filter(F.col("event_type") == "purchase")
+    .withColumn(
+        "revenue",
+        F.col("price") * F.col("quantity")
+    )
+)
+
+all_purchase_rdd = all_purchases.rdd.map(
+    lambda row: (
+        row["category"],
+        row["region"],
+        float(row["revenue"] or 0),
+        int(row["quantity"] or 0),
+        row["event_id"],
+        row["event_date"],
+    )
+)
+
+all_purchase_df = spark.createDataFrame(
+    all_purchase_rdd,
+    [
+        "category",
+        "region",
+        "revenue",
+        "quantity",
+        "event_id",
+        "event_date",
+    ],
+)
+
+updated_history = (
+    all_purchase_df
+    .groupBy("category", "region", "event_date")
+    .agg(
+        F.round(F.sum("revenue"), 2).alias("total_revenue"),
+        F.sum("quantity").alias("items_sold"),
+        F.countDistinct("event_id").alias("purchases"),
+    )
+)
+
+updated_history.write.mode("overwrite").saveAsTable(
     "ecommerce.daily_sales_history"
 )
+
+print("=== HISTÓRICO ATUALIZADO ===")
 
 spark.stop()

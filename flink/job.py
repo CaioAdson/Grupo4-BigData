@@ -80,9 +80,22 @@ def send_to_hbase(item):
 env = StreamExecutionEnvironment.get_execution_environment()
 env.set_parallelism(1)
 
+# CORREÇÃO: FileSource.monitor_continuously() só detecta ARQUIVOS NOVOS
+# aparecendo no diretório monitorado -- ele não observa um arquivo já
+# existente crescer (confirmado por um mantenedor do Flink na lista de
+# discussão do projeto: "there is no support for monitoring changes to
+# existing files"). Como o events.jsonl é um único arquivo que cresce para
+# sempre, apontar direto para ele fazia o Flink ler o conteúdo existente no
+# momento em que o arquivo era descoberto e nunca mais voltar a ele -- o
+# job parecia streaming, mas na prática parava de consumir dados novos.
+#
+# O serviço "flink-rotator" (rotator.py) lê o mesmo arquivo bruto e grava
+# lotes completos e imutáveis dentro de FLINK_READY_DIR. O Flink monitora
+# esse diretório: cada lote novo é um arquivo novo de verdade, exatamente
+# o cenário que monitor_continuously() sabe detectar.
 source = FileSource.for_record_stream_format(
     StreamFormat.text_line_format(),
-    os.getenv("EVENT_FILE", "/data/events.jsonl"),
+    os.getenv("FLINK_READY_DIR", "/ready"),
 ).monitor_continuously(Duration.of_seconds(2)).build()
 
 events = (

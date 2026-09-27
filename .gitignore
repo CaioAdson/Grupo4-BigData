@@ -5,3 +5,6 @@ validation.log
 __pycache__/
 .idea/
 .vscode/
+metastore_db/
+derby.log
+spark-warehouse/

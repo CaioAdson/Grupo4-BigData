@@ -12,9 +12,14 @@ spark = (
 
 spark.sql("CREATE DATABASE IF NOT EXISTS ecommerce")
 
+# CORREÇÃO: o Flume grava em subpastas particionadas
+# (.../raw/year=%Y/month=%m/day=%d/hour=%H/events-*), não em um arquivo
+# único chamado "events.jsonl". Apontar para a pasta-base faz o Spark
+# descobrir os arquivos recursivamente (e, de brinde, expõe year/month/
+# day/hour como colunas de partição via Hive-style partition discovery).
 input_path = os.getenv(
     "INPUT_PATH",
-    "hdfs://namenode:8020/ecommerce/raw/events.jsonl"
+    "hdfs://namenode:8020/ecommerce/raw"
 )
 
 events = (

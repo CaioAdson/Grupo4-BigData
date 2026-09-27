@@ -12,8 +12,31 @@ services:
 
   flume:
     build: {context: ./flume}
-    command: ["/opt/flume/bin/flume-ng", "agent", "--conf", "/opt/flume/conf", "--conf-file", "/project/flume/flume-test.conf", "--name", "agent", "-Dflume.root.logger=INFO,console"]
+    command: ["/opt/flume/bin/flume-ng", "agent", "--conf", "/opt/flume/conf", "--conf-file", "/project/flume/flume.conf", "--name", "agent", "-Dflume.root.logger=INFO,console"]
     volumes: ["./:/project:ro", "events:/data:ro", "flume-state:/state"]
+    depends_on: [generator]
+    restart: unless-stopped
+
+  # CORREÇÃO: o Flink não consegue acompanhar um único arquivo crescendo
+  # para sempre (monitor_continuously só detecta ARQUIVOS NOVOS, não o
+  # crescimento de um já existente). Este serviço lê o events.jsonl bruto
+  # e grava lotes completos e imutáveis em /ready, que é o que job.py
+  # realmente monitora. O Flume continua lendo o arquivo bruto direto,
+  # sem mudanças -- TAILDIR foi feito para arquivos que crescem.
+  flink-rotator:
+    image: python:3.12-slim
+    working_dir: /app
+    command: ["python", "-u", "/app/flink/rotator.py"]
+    environment:
+      EVENT_FILE: /data/events.jsonl
+      FLINK_READY_DIR: /ready
+      ROTATE_INTERVAL_SECONDS: "5"
+      ROTATOR_STATE_FILE: /state/rotator_offset.txt
+    volumes:
+      - "./:/app:ro"
+      - "events:/data:ro"
+      - "flink-ready:/ready"
+      - "rotator-state:/state"
     depends_on: [generator]
     restart: unless-stopped
 
@@ -44,7 +67,32 @@ services:
       - "16000:16000"
       - "16020:16020"
       - "2181:2181"
+      # Stargate/REST, usado por job.py (Flink) para gravar os alertas.
+      # Mapeado em 8090 no host para não colidir com a porta 8080 do Spark
+      # master (dentro da rede docker, o Flink continua falando com
+      # "hbase:8080" normalmente).
+      - "8090:8080"
     restart: unless-stopped
+
+  # CORREÇÃO: a tabela "product_alerts" nunca era criada automaticamente --
+  # dependia de um comando manual documentado só no README. Este serviço
+  # espera o HBase responder e cria a tabela sozinho; se ela já existir,
+  # ignora o erro. Roda uma vez e sai (sem restart).
+  hbase-init:
+    image: harisekhon/hbase:2.1
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        cp /hbase/conf/hbase-site.xml /tmp/hbase-site.xml; sed -i "s#<value>zookeeper:2181</value>#<value>hbase:2181</value>#" /hbase/conf/hbase-site.xml; echo "Aguardando o HBase responder..."
+        until echo "status" | hbase shell -n > /dev/null 2>&1; do
+          sleep 5
+        done
+        echo "HBase no ar. Garantindo a tabela product_alerts..."
+        echo "create 'product_alerts', 'info'" | hbase shell -n || true
+        echo "Tabela pronta (ou já existia)."
+    depends_on: [hbase]
+    restart: "no"
 
   datanode:
     image: apache/hadoop:3.4.1
@@ -71,8 +119,11 @@ services:
     ports:
       - "8081:8081"
     volumes:
-      - events:/data:ro
+      - flink-ready:/ready:ro
       - ./flink:/opt/flink/jobs:ro
+    depends_on:
+      hbase-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   flink-taskmanager:
@@ -82,11 +133,32 @@ services:
     command: taskmanager
     environment:
       FLINK_PROPERTIES: "jobmanager.rpc.address: flink-jobmanager\ntaskmanager.numberOfTaskSlots: 2\n"
-    depends_on:
-      - flink-jobmanager
     volumes:
-      - events:/data:ro
+      - flink-ready:/ready:ro
       - ./flink:/opt/flink/jobs:ro
+    depends_on:
+      flink-jobmanager:
+        condition: service_started
+      hbase-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # CORREÇÃO (opcional, ver CORRECOES.md): Hive Metastore de verdade, em vez
+  # de depender só do catálogo embutido (Derby por processo) do Spark. É o
+  # comando oficial documentado pelo próprio projeto Apache Hive. Se vocês
+  # não tiverem tempo de testar isso antes de gravar, comentem este serviço
+  # e o volume "hive-metastore-data" lá embaixo, e apaguem/comentem
+  # spark/conf/hive-site.xml -- o etl.py funciona igual, só volta a usar o
+  # metastore embutido do Spark.
+  hive-metastore:
+    image: apache/hive:4.0.0
+    hostname: hive-metastore
+    environment:
+      SERVICE_NAME: metastore
+    ports:
+      - "9083:9083"
+    volumes:
+      - hive-metastore-data:/opt/hive/data/warehouse
     restart: unless-stopped
 
   spark-master:
@@ -94,10 +166,17 @@ services:
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
     environment:
       - SPARK_CONF_DIR=/opt/spark/conf
+    # CORREÇÃO: nenhuma porta estava exposta. README e semana-01.md prometem
+    # a UI do Spark em localhost:8080; sem isso, ela não aparece no host.
+    # 7077 é a porta RPC usada pelo spark-worker para se conectar ao master.
+    ports:
+      - "8080:8080"
+      - "7077:7077"
     volumes:
       - ./spark:/opt/spark/jobs:ro
       - ./spark/conf:/opt/spark/conf:ro
-    
+    depends_on: [hive-metastore]
+    restart: unless-stopped
 
   spark-worker:
     image: apache/spark:3.5.5
@@ -107,9 +186,14 @@ services:
     volumes:
       - ./spark:/opt/spark/jobs:ro
       - ./spark/conf:/opt/spark/conf:ro
-      
+    restart: unless-stopped
+
 volumes:
   events:
   flume-state:
+  flink-ready:
+  rotator-state:
   namenode-data:
   datanode-data:
+  hive-metastore-data:
+
